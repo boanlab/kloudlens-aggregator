@@ -21,6 +21,13 @@ type PromCollector struct {
 	walLastSeq  *prometheus.Desc
 	subDrops    *prometheus.Desc
 	subscribers *prometheus.Desc
+
+	xnodeJoins      *prometheus.Desc
+	xnodeMisses     *prometheus.Desc
+	vipJoins        *prometheus.Desc
+	registrySize    *prometheus.Desc
+	epsliceEntries  *prometheus.Desc
+	servicesWatched *prometheus.Desc
 }
 
 // NewPromCollector returns a Collector ready to be handed to
@@ -74,6 +81,36 @@ func NewPromCollector(agg *Aggregator) *PromCollector {
 			"Downstream re-export clients currently connected to the aggregator. Correlate with subscriber_dropped_total to distinguish fleet churn from sustained backpressure.",
 			nil, nil,
 		),
+		xnodeJoins: prometheus.NewDesc(
+			"kloudlens_agg_xnode_joins_total",
+			"NetworkExchange peers resolved to a cluster listener (a ClusterPeerEdge was emitted).",
+			nil, nil,
+		),
+		xnodeMisses: prometheus.NewDesc(
+			"kloudlens_agg_xnode_misses_total",
+			"NetworkExchange peers with no live cluster listener; no edge emitted and no peer fabricated.",
+			nil, nil,
+		),
+		vipJoins: prometheus.NewDesc(
+			"kloudlens_agg_vip_joins_total",
+			"NetworkExchange peers resolved through a Service ClusterIP (VIP) to their backend workload. Subset of kloudlens_agg_xnode_joins_total.",
+			nil, nil,
+		),
+		registrySize: prometheus.NewDesc(
+			"kloudlens_agg_listener_registry_size",
+			"Live (unexpired) entries in the cluster listener registry, folded from ListenerAdvertise events.",
+			nil, nil,
+		),
+		epsliceEntries: prometheus.NewDesc(
+			"kloudlens_agg_endpointslice_entries",
+			"Live pod endpoints in the EndpointSlice index used for cross-node DNAT resolution (0 when no resolver is wired).",
+			nil, nil,
+		),
+		servicesWatched: prometheus.NewDesc(
+			"kloudlens_agg_services_watched",
+			"Live Kubernetes Services (by ClusterIP) in the Service-VIP index used for cross-node VIP resolution (0 when no resolver is wired).",
+			nil, nil,
+		),
 	}
 }
 
@@ -87,6 +124,12 @@ func (c *PromCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.walLastSeq
 	ch <- c.subDrops
 	ch <- c.subscribers
+	ch <- c.xnodeJoins
+	ch <- c.xnodeMisses
+	ch <- c.vipJoins
+	ch <- c.registrySize
+	ch <- c.epsliceEntries
+	ch <- c.servicesWatched
 }
 
 func (c *PromCollector) Collect(ch chan<- prometheus.Metric) {
@@ -100,4 +143,10 @@ func (c *PromCollector) Collect(ch chan<- prometheus.Metric) {
 	ch <- prometheus.MustNewConstMetric(c.walLastSeq, prometheus.GaugeValue, float64(s.WALLastSeq))
 	ch <- prometheus.MustNewConstMetric(c.subDrops, prometheus.CounterValue, float64(s.SubscriberDropped))
 	ch <- prometheus.MustNewConstMetric(c.subscribers, prometheus.GaugeValue, float64(s.Subscribers))
+	ch <- prometheus.MustNewConstMetric(c.xnodeJoins, prometheus.CounterValue, float64(s.XNodeJoins))
+	ch <- prometheus.MustNewConstMetric(c.xnodeMisses, prometheus.CounterValue, float64(s.XNodeMisses))
+	ch <- prometheus.MustNewConstMetric(c.vipJoins, prometheus.CounterValue, float64(s.VIPJoins))
+	ch <- prometheus.MustNewConstMetric(c.registrySize, prometheus.GaugeValue, float64(s.ListenerRegistrySize))
+	ch <- prometheus.MustNewConstMetric(c.epsliceEntries, prometheus.GaugeValue, float64(s.EndpointSliceEntries))
+	ch <- prometheus.MustNewConstMetric(c.servicesWatched, prometheus.GaugeValue, float64(s.ServicesWatched))
 }

@@ -30,6 +30,7 @@ import (
 	"time"
 
 	"github.com/boanlab/kloudlens-aggregator/internal/aggregator"
+	"github.com/boanlab/kloudlens-aggregator/internal/aggregator/clusterpeers"
 	"github.com/boanlab/kloudlens-aggregator/internal/aggregator/discovery"
 	"github.com/boanlab/kloudlens-aggregator/internal/aggregator/envwal"
 	pb "github.com/boanlab/kloudlens/protobuf"
@@ -64,6 +65,7 @@ type cliFlags struct {
 	k8sCAFile    string
 	k8sTokenFile string
 	agentPort    int
+	resolveVIP   bool
 	showVersion  bool
 }
 
@@ -109,6 +111,8 @@ func parseFlags() cliFlags {
 		"Kubernetes ServiceAccount token path (default: /var/run/secrets/kubernetes.io/serviceaccount/token)")
 	flag.IntVar(&f.agentPort, "agent-port", 0,
 		"TCP port to use for each discovered agent pod; 0 = first port in the EndpointSlice")
+	flag.BoolVar(&f.resolveVIP, "resolve-service-vip", true,
+		"with --k8s-service, watch Services + EndpointSlices cluster-wide to resolve connects to a Service ClusterIP (VIP) to the backing remote workload (needs cluster-scoped get/list/watch on services and endpointslices)")
 	flag.BoolVar(&f.showVersion, "version", false,
 		"print the build version and exit")
 	flag.Parse()
@@ -174,24 +178,42 @@ func run(f cliFlags) error {
 	defer cancel()
 
 	var discoveryCh <-chan []aggregator.AgentEndpoint
+	var podIndex *discovery.PodEndpointIndex
+	var svcIndex *discovery.ServiceIndex
 	if f.k8sService != "" {
-		ch, err := startK8sDiscovery(ctx, f)
+		// The pod-endpoint index is folded from the same EndpointSlices the
+		// agent-discovery watcher streams, so cross-node peer resolution covers
+		// the pods backing that Service. It resolves DNATed endpoints to pod
+		// addresses; Service ClusterIPs are a miss (not in EndpointSlice).
+		podIndex = discovery.NewPodEndpointIndex()
+		ch, err := startK8sDiscovery(ctx, f, podIndex)
 		if err != nil {
 			return err
 		}
 		discoveryCh = ch
+		if f.resolveVIP {
+			// A separate cluster-wide Service + EndpointSlice watch resolves a
+			// connect to a Service ClusterIP (VIP) to its backing workload. Most
+			// real cross-node traffic goes through a VIP (kube-proxy DNATs
+			// ClusterIP → a backend pod), so without this a VIP connect is an
+			// honest miss and cross-node attribution is largely blind.
+			svcIndex = discovery.NewServiceIndex()
+			startServiceVIPWatch(ctx, f, svcIndex)
+		}
 	}
 
 	agg, err := aggregator.New(aggregator.Config{
-		Agents:     agents,
-		Out:        out,
-		Streams:    strings.Split(f.streams, ","),
-		ConsumerID: f.consumerID,
-		Backoff:    f.backoff,
-		QueueDepth: f.queueDepth,
-		Cursors:    cursors,
-		WAL:        wal,
-		Discovery:  discoveryCh,
+		Agents:           agents,
+		Out:              out,
+		Streams:          strings.Split(f.streams, ","),
+		ConsumerID:       f.consumerID,
+		Backoff:          f.backoff,
+		QueueDepth:       f.queueDepth,
+		Cursors:          cursors,
+		WAL:              wal,
+		Discovery:        discoveryCh,
+		EndpointResolver: resolverOrNil(podIndex),
+		ServiceResolver:  svcResolverOrNil(svcIndex),
 	})
 	if err != nil {
 		return err
@@ -216,6 +238,44 @@ func run(f cliFlags) error {
 	fmt.Fprintf(os.Stderr, "kloudlens-aggregator: agents=%d streams=%s output=%s\n",
 		len(agents), f.streams, f.output)
 	return agg.Run(ctx)
+}
+
+// resolverOrNil returns idx as a clusterpeers.EndpointResolver, or an untyped
+// nil interface when idx is nil (avoids a typed-nil interface that the
+// aggregator would treat as a live-but-panicking resolver).
+func resolverOrNil(idx *discovery.PodEndpointIndex) clusterpeers.EndpointResolver {
+	if idx == nil {
+		return nil
+	}
+	return idx
+}
+
+// svcResolverOrNil returns idx as a clusterpeers.ServiceResolver, or an untyped
+// nil interface when idx is nil (same typed-nil guard as resolverOrNil).
+func svcResolverOrNil(idx *discovery.ServiceIndex) clusterpeers.ServiceResolver {
+	if idx == nil {
+		return nil
+	}
+	return idx
+}
+
+// startServiceVIPWatch launches the cluster-wide Service + EndpointSlice watch
+// that keeps idx live for Service-VIP resolution. Runs until ctx is cancelled;
+// watch errors are retried internally, so a transient RBAC/API hiccup degrades
+// VIP joins to misses rather than crashing the aggregator.
+func startServiceVIPWatch(ctx context.Context, f cliFlags, idx *discovery.ServiceIndex) {
+	w := &discovery.ServiceWatcher{
+		APIServer: f.k8sAPIServer,
+		CAFile:    f.k8sCAFile,
+		TokenFile: f.k8sTokenFile,
+		Index:     idx,
+	}
+	go func() {
+		if err := w.Run(ctx); err != nil && ctx.Err() == nil {
+			log.Printf("service-vip watch: %v", err)
+		}
+	}()
+	fmt.Fprintln(os.Stderr, "kloudlens-aggregator: service-vip resolution watching services + endpointslices cluster-wide")
 }
 
 func parseAgents(csv string) []aggregator.AgentEndpoint {
@@ -299,7 +359,7 @@ func serveReExport(addr, aggregatorID string, agg *aggregator.Aggregator) (func(
 // EndpointSliceWatcher and bridges its Endpoint emissions into the
 // aggregator.AgentEndpoint shape the aggregator consumes. Runs until ctx is
 // cancelled; the returned channel closes when the watcher goroutine exits.
-func startK8sDiscovery(ctx context.Context, f cliFlags) (<-chan []aggregator.AgentEndpoint, error) {
+func startK8sDiscovery(ctx context.Context, f cliFlags, podIndex *discovery.PodEndpointIndex) (<-chan []aggregator.AgentEndpoint, error) {
 	ns, svc, ok := strings.Cut(f.k8sService, "/")
 	if !ok || ns == "" || svc == "" {
 		return nil, fmt.Errorf("--k8s-service must be namespace/name, got %q", f.k8sService)
@@ -311,6 +371,7 @@ func startK8sDiscovery(ctx context.Context, f cliFlags) (<-chan []aggregator.Age
 		Namespace:   ns,
 		ServiceName: svc,
 		TargetPort:  int32(f.agentPort), // #nosec G115 -- CLI flag (int) narrowing to int32 port
+		PodIndex:    podIndex,
 	}
 	src, err := w.Run(ctx)
 	if err != nil {

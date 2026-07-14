@@ -19,6 +19,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/boanlab/kloudlens-aggregator/internal/aggregator/clusterpeers"
 	"github.com/boanlab/kloudlens-aggregator/internal/aggregator/envwal"
 	pb "github.com/boanlab/kloudlens/protobuf"
 
@@ -70,6 +71,24 @@ type Config struct {
 	// NewClient is overridable for tests that want to inject bufconn dialers.
 	// Production callers leave it nil (the default uses grpc.NewClient).
 	NewClient func(addr string, opts ...grpc.DialOption) (*grpc.ClientConn, error)
+
+	// AdvertiseTTL is the lifetime of a cluster listener registry entry before
+	// a fresh ListenerAdvertise must refresh it. 0 → clusterpeers.DefaultTTL (30s).
+	AdvertiseTTL time.Duration
+
+	// EndpointResolver, when set, folds Service/endpoint IPs to backing pod
+	// addresses during a cross-node join (the EndpointSlice DNAT case).
+	// discovery.PodEndpointIndex satisfies this. nil disables the endpointslice
+	// join path (exact + wildcard still resolve). When it also exposes Len()
+	// int, that count feeds the endpointslice-entries gauge.
+	EndpointResolver clusterpeers.EndpointResolver
+
+	// ServiceResolver, when set, resolves a Service ClusterIP:port (a VIP) to
+	// its backend listener set during a cross-node join (the kube-proxy DNAT
+	// case that carries most real cross-node traffic). discovery.ServiceIndex
+	// satisfies this. nil disables the service-vip join path. When it also
+	// exposes NumServices() int, that count feeds the services-watched gauge.
+	ServiceResolver clusterpeers.ServiceResolver
 }
 
 // Aggregator is the run-time state built from Config. Create with New() and
@@ -86,6 +105,9 @@ type Aggregator struct {
 	walAppends  atomic.Uint64 // envelopes appended to the aggregator WAL
 	walErrors   atomic.Uint64 // WAL append failures (NDJSON emit still attempted)
 	subsDropped atomic.Uint64 // broadcast drops summed across already-unregistered subscribers
+	xnodeJoins  atomic.Uint64 // NetworkExchange peers resolved to a cluster listener
+	xnodeMisses atomic.Uint64 // NetworkExchange peers with no live listener (no edge emitted)
+	vipJoins    atomic.Uint64 // subset of xnodeJoins resolved through a Service VIP
 
 	// liveSeq is the in-memory counter the aggregator uses to tag live
 	// broadcasts when no WAL is configured. When a WAL is set, broadcasts
@@ -95,6 +117,13 @@ type Aggregator struct {
 
 	subsMu sync.Mutex
 	subs   map[*liveSubscriber]struct{}
+
+	// registry folds ListenerAdvertise events into a TTL map and resolves
+	// NetworkExchange peers into cross-node ClusterPeerEdge emits. Always
+	// non-nil after New; the EndpointSlice and Service-VIP resolvers are optional.
+	registry    *clusterpeers.Registry
+	resolver    clusterpeers.EndpointResolver
+	svcResolver clusterpeers.ServiceResolver
 }
 
 // liveSubscriber is one downstream re-export client. Each Subscribe call
@@ -134,6 +163,13 @@ type Stats struct {
 	WALErrors         uint64
 	WALLastSeq        uint64
 	SubscriberDropped uint64
+	// Cross-node peer attribution.
+	XNodeJoins           uint64 // NetworkExchange peers resolved to a cluster listener
+	XNodeMisses          uint64 // NetworkExchange peers with no live listener
+	VIPJoins             uint64 // subset of XNodeJoins resolved through a Service VIP
+	ListenerRegistrySize int    // live entries in the cluster listener registry
+	EndpointSliceEntries int    // live pod endpoints in the EndpointSlice index
+	ServicesWatched      int    // live Services in the Service-VIP index
 }
 
 var errNoAgents = errors.New("aggregator: no agents configured")
@@ -165,9 +201,12 @@ func New(cfg Config) (*Aggregator, error) {
 		cfg.Cursors = NullCursorStore()
 	}
 	return &Aggregator{
-		cfg:  cfg,
-		ch:   make(chan envelopeWithAgent, cfg.QueueDepth),
-		subs: make(map[*liveSubscriber]struct{}),
+		cfg:         cfg,
+		ch:          make(chan envelopeWithAgent, cfg.QueueDepth),
+		subs:        make(map[*liveSubscriber]struct{}),
+		registry:    clusterpeers.NewRegistry(cfg.AdvertiseTTL, cfg.EndpointResolver, cfg.ServiceResolver),
+		resolver:    cfg.EndpointResolver,
+		svcResolver: cfg.ServiceResolver,
 	}, nil
 }
 
@@ -319,12 +358,24 @@ func (a *Aggregator) startEndpoint(ctx context.Context, ep AgentEndpoint, active
 // Stats returns the current counter snapshot. Safe for concurrent callers.
 func (a *Aggregator) Stats() Stats {
 	s := Stats{
-		Received:   a.received.Load(),
-		Written:    a.written.Load(),
-		Dropped:    a.dropped.Load(),
-		Errors:     a.errors.Load(),
-		WALAppends: a.walAppends.Load(),
-		WALErrors:  a.walErrors.Load(),
+		Received:    a.received.Load(),
+		Written:     a.written.Load(),
+		Dropped:     a.dropped.Load(),
+		Errors:      a.errors.Load(),
+		WALAppends:  a.walAppends.Load(),
+		WALErrors:   a.walErrors.Load(),
+		XNodeJoins:  a.xnodeJoins.Load(),
+		XNodeMisses: a.xnodeMisses.Load(),
+		VIPJoins:    a.vipJoins.Load(),
+	}
+	if a.registry != nil {
+		s.ListenerRegistrySize = a.registry.Size()
+	}
+	if l, ok := a.resolver.(interface{ Len() int }); ok {
+		s.EndpointSliceEntries = l.Len()
+	}
+	if sv, ok := a.svcResolver.(interface{ NumServices() int }); ok {
+		s.ServicesWatched = sv.NumServices()
 	}
 	if a.cfg.WAL != nil {
 		s.WALLastSeq = a.cfg.WAL.LastSeq()
@@ -349,46 +400,115 @@ func (a *Aggregator) writeLoop() {
 	// line: `{"_agent":"<name>","envelope":<protojson>}\n`.
 	marshal := protojson.MarshalOptions{UseProtoNames: false}
 	for ev := range a.ch {
-		var seq uint64
-		if a.cfg.WAL != nil {
-			s, err := a.cfg.WAL.Append(ev.Agent, ev.Envelope)
-			if err != nil {
-				a.walErrors.Add(1)
-				// NDJSON emit is still worth attempting — a transient WAL
-				// write failure shouldn't silence the live stream. We fall
-				// back to the in-memory liveSeq so broadcast ordering holds.
-				seq = a.liveSeq.Add(1)
-			} else {
-				a.walAppends.Add(1)
-				seq = s
-				a.liveSeq.Store(s)
-			}
-		} else {
-			seq = a.liveSeq.Add(1)
-		}
-		a.broadcast(liveEnvelope{Seq: seq, Agent: ev.Agent, Envelope: ev.Envelope})
-		envBytes, err := marshal.Marshal(ev.Envelope)
-		if err != nil {
-			a.errors.Add(1)
+		// Cross-node hook. ListenerAdvertise events feed the registry and are
+		// NOT re-emitted downstream (control-plane chatter; one per listener
+		// every ~10s). A NetworkExchange that resolves to a cluster listener
+		// yields a ClusterPeerEdge, emitted right after its source below so it
+		// inherits the next cluster seq — the edge is contiguous with its
+		// trigger in both the WAL and the re-export stream, and no extra
+		// synchronisation is needed because writeLoop is the sole seq assigner.
+		if a.foldAdvertise(ev.Envelope) {
 			continue
 		}
-		agentBytes, err := marshalJSONString(ev.Agent)
-		if err != nil {
-			a.errors.Add(1)
-			continue
+		a.emitEnvelope(marshal, ev)
+		if edge := a.joinPeer(ev.Envelope); edge != nil {
+			a.emitEnvelope(marshal, envelopeWithAgent{
+				Agent:    ev.Agent,
+				Envelope: &pb.EventEnvelope{Payload: &pb.EventEnvelope_Intent{Intent: edge}},
+			})
 		}
-		line := make([]byte, 0, len(envBytes)+len(agentBytes)+24)
-		line = append(line, `{"_agent":`...)
-		line = append(line, agentBytes...)
-		line = append(line, `,"envelope":`...)
-		line = append(line, envBytes...)
-		line = append(line, '}', '\n')
-		if _, err := a.cfg.Out.Write(line); err != nil {
-			a.errors.Add(1)
-			continue
-		}
-		a.written.Add(1)
 	}
+}
+
+// emitEnvelope assigns the next cluster seq (WAL or in-memory), broadcasts to
+// re-export subscribers, and writes the NDJSON line. Extracted so a synthesised
+// ClusterPeerEdge rides the exact same path as an upstream envelope.
+func (a *Aggregator) emitEnvelope(marshal protojson.MarshalOptions, ev envelopeWithAgent) {
+	var seq uint64
+	if a.cfg.WAL != nil {
+		s, err := a.cfg.WAL.Append(ev.Agent, ev.Envelope)
+		if err != nil {
+			a.walErrors.Add(1)
+			// NDJSON emit is still worth attempting — a transient WAL
+			// write failure shouldn't silence the live stream. We fall
+			// back to the in-memory liveSeq so broadcast ordering holds.
+			seq = a.liveSeq.Add(1)
+		} else {
+			a.walAppends.Add(1)
+			seq = s
+			a.liveSeq.Store(s)
+		}
+	} else {
+		seq = a.liveSeq.Add(1)
+	}
+	a.broadcast(liveEnvelope{Seq: seq, Agent: ev.Agent, Envelope: ev.Envelope})
+	envBytes, err := marshal.Marshal(ev.Envelope)
+	if err != nil {
+		a.errors.Add(1)
+		return
+	}
+	agentBytes, err := marshalJSONString(ev.Agent)
+	if err != nil {
+		a.errors.Add(1)
+		return
+	}
+	line := make([]byte, 0, len(envBytes)+len(agentBytes)+24)
+	line = append(line, `{"_agent":`...)
+	line = append(line, agentBytes...)
+	line = append(line, `,"envelope":`...)
+	line = append(line, envBytes...)
+	line = append(line, '}', '\n')
+	if _, err := a.cfg.Out.Write(line); err != nil {
+		a.errors.Add(1)
+		return
+	}
+	a.written.Add(1)
+}
+
+// foldAdvertise folds a ListenerAdvertise envelope into the cluster registry.
+// It returns true when the envelope was an advertise (and should be consumed,
+// not re-emitted downstream), false otherwise.
+func (a *Aggregator) foldAdvertise(env *pb.EventEnvelope) bool {
+	intent := env.GetIntent()
+	if intent == nil || intent.GetKind() != clusterpeers.KindListenerAdvertise {
+		return false
+	}
+	if l, ok := clusterpeers.ListenerFromAdvertise(intent); ok {
+		a.registry.Observe(l)
+	}
+	return true
+}
+
+// joinPeer runs a cross-node attribution join for a NetworkExchange envelope
+// whose peer was not already same-node-attributed by the kernel. On a hit it
+// returns a ClusterPeerEdge IntentEvent; otherwise nil (and, on a genuine
+// lookup, advances the miss counter). Envelopes that are not eligible
+// NetworkExchange events return nil without touching either counter.
+func (a *Aggregator) joinPeer(env *pb.EventEnvelope) *pb.IntentEvent {
+	intent := env.GetIntent()
+	if intent == nil || intent.GetKind() != clusterpeers.KindNetworkExchange {
+		return nil
+	}
+	attrs := intent.GetAttributes()
+	peer := attrs[clusterpeers.AttrPeer]
+	if peer == "" {
+		return nil
+	}
+	// The kernel already attributed a same-node peer; do not re-run the join.
+	if _, already := attrs[clusterpeers.AttrPeerPID]; already {
+		return nil
+	}
+	connectorNode := intent.GetMeta().GetNodeName()
+	l, how, ok := a.registry.Join(peer, connectorNode)
+	if !ok {
+		a.xnodeMisses.Add(1)
+		return nil
+	}
+	a.xnodeJoins.Add(1)
+	if how == clusterpeers.HowServiceVIP {
+		a.vipJoins.Add(1)
+	}
+	return clusterpeers.PeerEdge(intent, l, how, connectorNode)
 }
 
 // marshalJSONString returns the JSON-quoted form of s (with escapes). Kept

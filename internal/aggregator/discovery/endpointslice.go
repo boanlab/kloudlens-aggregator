@@ -54,6 +54,11 @@ type EndpointSliceWatcher struct {
 	HTTPClient *http.Client
 	// ReconnectBackoff is the delay between watch reconnects. 0 → 2s.
 	ReconnectBackoff time.Duration
+	// PodIndex, when set, is refreshed on every state change with the pod-IP
+	// map used for cross-node peer attribution (DNAT endpoint → pod addr). It
+	// is folded from the same EndpointSlices this watcher already streams, so
+	// no extra watch is opened; the slices seen determine what resolves.
+	PodIndex *PodEndpointIndex
 }
 
 const (
@@ -114,9 +119,15 @@ func buildClient(caFile string) (*http.Client, error) {
 }
 
 func (w *EndpointSliceWatcher) authHeader() (string, error) {
-	token, err := os.ReadFile(w.TokenFile)
+	return bearerAuth(w.TokenFile)
+}
+
+// bearerAuth reads a ServiceAccount token file and returns the Authorization
+// header value. Shared by the EndpointSlice and Service watchers.
+func bearerAuth(tokenFile string) (string, error) {
+	token, err := os.ReadFile(tokenFile)
 	if err != nil {
-		return "", fmt.Errorf("discovery: read token %s: %w", w.TokenFile, err)
+		return "", fmt.Errorf("discovery: read token %s: %w", tokenFile, err)
 	}
 	return "Bearer " + strings.TrimSpace(string(token)), nil
 }
@@ -134,6 +145,7 @@ func (w *EndpointSliceWatcher) loop(ctx context.Context, out chan<- []Endpoint) 
 			w.sleepBackoff(ctx)
 			continue
 		}
+		w.refreshIndex(state)
 		emit(ctx, out, state, w.TargetPort)
 		if err := w.watchUntilErr(ctx, rv, state, out); err != nil {
 			w.sleepBackoff(ctx)
@@ -241,6 +253,7 @@ func (w *EndpointSliceWatcher) watchUntilErr(ctx context.Context, rv string, sta
 		default:
 			continue
 		}
+		w.refreshIndex(state)
 		emit(ctx, out, state, w.TargetPort)
 	}
 	if err := sc.Err(); err != nil {
@@ -285,6 +298,22 @@ type sliceEndpoint struct {
 		Terminating *bool `json:"terminating"`
 	} `json:"conditions"`
 	NodeName string `json:"nodeName"`
+	// TargetRef identifies the pod backing this endpoint (Kind=Pod). Its
+	// namespace/name give the pod identity used to attribute a wildcard bind to
+	// the specific advertising pod by its reachable IP.
+	TargetRef struct {
+		Namespace string `json:"namespace"`
+		Name      string `json:"name"`
+	} `json:"targetRef"`
+}
+
+// refreshIndex rebuilds the pod-endpoint index from the current slice state
+// when the watcher has one wired. No-op otherwise.
+func (w *EndpointSliceWatcher) refreshIndex(state map[string]sliceObject) {
+	if w.PodIndex == nil {
+		return
+	}
+	w.PodIndex.Replace(entriesFromState(state))
 }
 
 // emit snapshots state into an Endpoint slice and sends it on out. Callers
