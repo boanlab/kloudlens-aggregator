@@ -197,3 +197,73 @@ func TestServiceWatcherListPopulatesIndex(t *testing.T) {
 	}
 	t.Fatal("watcher did not populate the index within 2s")
 }
+
+// TestApplySlicesFeedsPodIndex pins Fix A: the cluster-wide Service +
+// EndpointSlice watch must fold every ready endpoint's pod IP into the
+// PodEndpointIndex, keyed to the pod identity from targetRef. This is what
+// makes the direct (pod-IP) cross-node join resolvable — without it PodForIP
+// never places a workload pod IP and every wildcard-bind join misses.
+func TestApplySlicesFeedsPodIndex(t *testing.T) {
+	// A redis Deployment's EndpointSlice: pod IP 10.244.2.106 backed by pod
+	// redis-single-abc in ns xnode, serving :6379.
+	slice := `{"metadata":{"namespace":"xnode","name":"redis-single-svc-x1",
+		"labels":{"kubernetes.io/service-name":"redis-single-svc"}},
+		"ports":[{"name":"","port":6379}],
+		"endpoints":[{"addresses":["10.244.2.106"],"conditions":{"ready":true},
+			"targetRef":{"namespace":"xnode","name":"redis-single-abc"}}]}`
+
+	podIdx := NewPodEndpointIndex()
+	w := &ServiceWatcher{Index: NewServiceIndex(), PodIndex: podIdx}
+	w.applySlices(rawState(t, slice))
+
+	// The concrete pod IP:port resolves to itself (it is a real endpoint)...
+	if _, ok := podIdx.ResolvePodAddr("10.244.2.106:6379"); !ok {
+		t.Fatal("pod IP:port should be a known endpoint after applySlices")
+	}
+	// ...and carries the pod identity from targetRef.
+	ns, pod, ok := podIdx.PodForIP("10.244.2.106")
+	if !ok {
+		t.Fatal("PodForIP must place the workload pod IP the cluster watch saw")
+	}
+	if ns != "xnode" || pod != "redis-single-abc" {
+		t.Fatalf("pod identity wrong: %s/%s, want xnode/redis-single-abc", ns, pod)
+	}
+}
+
+// TestApplySlicesPodIndexDropsDeletedPod pins the churn/eviction guarantee:
+// Replace is whole-state, so a pod whose EndpointSlice endpoint went away drops
+// out of the index — a later connect to its stale IP then misses honestly
+// instead of resolving to a same-port survivor.
+func TestApplySlicesPodIndexDropsDeletedPod(t *testing.T) {
+	twoReady := `{"metadata":{"namespace":"xnode","name":"redis-svc-x1",
+		"labels":{"kubernetes.io/service-name":"redis-svc"}},
+		"ports":[{"name":"","port":6379}],
+		"endpoints":[
+			{"addresses":["10.244.2.106"],"conditions":{"ready":true},
+			 "targetRef":{"namespace":"xnode","name":"ra"}},
+			{"addresses":["10.244.2.116"],"conditions":{"ready":true},
+			 "targetRef":{"namespace":"xnode","name":"rb"}}]}`
+	podIdx := NewPodEndpointIndex()
+	w := &ServiceWatcher{Index: NewServiceIndex(), PodIndex: podIdx}
+	w.applySlices(rawState(t, twoReady))
+
+	if _, _, ok := podIdx.PodForIP("10.244.2.116"); !ok {
+		t.Fatal("rb should be placeable while ready")
+	}
+
+	// rb deleted: its endpoint disappears from the slice state.
+	onlyRA := `{"metadata":{"namespace":"xnode","name":"redis-svc-x1",
+		"labels":{"kubernetes.io/service-name":"redis-svc"}},
+		"ports":[{"name":"","port":6379}],
+		"endpoints":[
+			{"addresses":["10.244.2.106"],"conditions":{"ready":true},
+			 "targetRef":{"namespace":"xnode","name":"ra"}}]}`
+	w.applySlices(rawState(t, onlyRA))
+
+	if _, _, ok := podIdx.PodForIP("10.244.2.116"); ok {
+		t.Fatal("rb's stale IP must drop out of the index after it leaves the slice")
+	}
+	if ns, pod, ok := podIdx.PodForIP("10.244.2.106"); !ok || pod != "ra" || ns != "xnode" {
+		t.Fatalf("ra must remain placeable: (%s/%s, %v)", ns, pod, ok)
+	}
+}
