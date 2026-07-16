@@ -20,9 +20,18 @@ metadata:
   name: kloudlens-aggregator
 rules:
 # EndpointSlice watch is what discovers the kloudlens DaemonSet pods so the
-# aggregator can re-subscribe automatically when nodes roll.
+# aggregator can re-subscribe automatically when nodes roll. The same
+# cluster-scoped watch also feeds the cross-node PodEndpointIndex (resolving a
+# DNATed pod endpoint to its backing workload).
 - apiGroups: ["discovery.k8s.io"]
   resources: ["endpointslices"]
+  verbs: ["get", "list", "watch"]
+# Services back the ServiceIndex used by --resolve-service-vip (default on),
+# which resolves a Service ClusterIP (VIP) connect to the backend workload
+# kube-proxy DNATs it to. Without this the VIP half of cross-node attribution
+# silently resolves nothing (kloudlens_agg_services_watched stays 0).
+- apiGroups: [""]
+  resources: ["services"]
   verbs: ["get", "list", "watch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
