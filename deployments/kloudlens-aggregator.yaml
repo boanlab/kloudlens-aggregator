@@ -89,7 +89,11 @@ spec:
       containers:
       - name: aggregator
         image: boanlab/kloudlens-aggregator:latest
-        imagePullPolicy: Always
+        # IfNotPresent so a node-local (side-loaded via `ctr images import`)
+        # image is used as-is. `Always` forces a registry pull on every start,
+        # which fails (ImagePullBackOff) for locally built / air-gapped images.
+        # Matches the agent and CLI manifests, which already use IfNotPresent.
+        imagePullPolicy: IfNotPresent
         # The aggregator binary's ENTRYPOINT defaults to --help; override it
         # with the real flags here. EndpointSlice discovery follows the
         # headless service that fronts the kloudlens DaemonSet (port name
