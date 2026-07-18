@@ -181,25 +181,23 @@ func run(f cliFlags) error {
 	var podIndex *discovery.PodEndpointIndex
 	var svcIndex *discovery.ServiceIndex
 	if f.k8sService != "" {
-		// The pod-endpoint index is folded from the same EndpointSlices the
-		// agent-discovery watcher streams, so cross-node peer resolution covers
-		// the pods backing that Service. It resolves DNATed endpoints to pod
-		// addresses; Service ClusterIPs are a miss (not in EndpointSlice).
-		podIndex = discovery.NewPodEndpointIndex()
-		ch, err := startK8sDiscovery(ctx, f, podIndex)
+		// (1) Agent-discovery watch — scoped to the agent Service, used only to
+		// discover agent pods to subscribe to. Does not feed the pod-index.
+		ch, err := startK8sDiscovery(ctx, f)
 		if err != nil {
 			return err
 		}
 		discoveryCh = ch
-		if f.resolveVIP {
-			// A separate cluster-wide Service + EndpointSlice watch resolves a
-			// connect to a Service ClusterIP (VIP) to its backing workload. Most
-			// real cross-node traffic goes through a VIP (kube-proxy DNATs
-			// ClusterIP → a backend pod), so without this a VIP connect is an
-			// honest miss and cross-node attribution is largely blind.
-			svcIndex = discovery.NewServiceIndex()
-			startServiceVIPWatch(ctx, f, svcIndex)
-		}
+
+		// (2) Cluster-wide Service + EndpointSlice watch — the source for
+		// cross-node peer resolution. It folds every workload's pod IP into the
+		// PodEndpointIndex (needed for the direct pod-IP path) and, when
+		// --resolve-service-vip is on, resolves Service ClusterIPs (VIPs) too.
+		// svcIndex is always built so the watcher has its required Index; VIP
+		// resolution is only exposed to the aggregator when the flag is on.
+		podIndex = discovery.NewPodEndpointIndex()
+		svcIndex = discovery.NewServiceIndex()
+		startClusterEndpointWatch(ctx, f, svcIndex, podIndex)
 	}
 
 	agg, err := aggregator.New(aggregator.Config{
@@ -213,7 +211,9 @@ func run(f cliFlags) error {
 		WAL:              wal,
 		Discovery:        discoveryCh,
 		EndpointResolver: resolverOrNil(podIndex),
-		ServiceResolver:  svcResolverOrNil(svcIndex),
+		// svcIndex is always built (to feed the watcher), but VIP resolution is
+		// only wired into joins when the operator opts in via --resolve-service-vip.
+		ServiceResolver: svcResolverWhen(f.resolveVIP, svcIndex),
 	})
 	if err != nil {
 		return err
@@ -250,32 +250,38 @@ func resolverOrNil(idx *discovery.PodEndpointIndex) clusterpeers.EndpointResolve
 	return idx
 }
 
-// svcResolverOrNil returns idx as a clusterpeers.ServiceResolver, or an untyped
-// nil interface when idx is nil (same typed-nil guard as resolverOrNil).
-func svcResolverOrNil(idx *discovery.ServiceIndex) clusterpeers.ServiceResolver {
-	if idx == nil {
+// svcResolverWhen returns idx as a clusterpeers.ServiceResolver when enabled,
+// or an untyped nil interface otherwise (same typed-nil guard as resolverOrNil).
+// The Service watch always runs to feed the pod-index; this only controls
+// whether Service-VIP resolution is consulted during joins.
+func svcResolverWhen(enabled bool, idx *discovery.ServiceIndex) clusterpeers.ServiceResolver {
+	if !enabled || idx == nil {
 		return nil
 	}
 	return idx
 }
 
-// startServiceVIPWatch launches the cluster-wide Service + EndpointSlice watch
-// that keeps idx live for Service-VIP resolution. Runs until ctx is cancelled;
-// watch errors are retried internally, so a transient RBAC/API hiccup degrades
-// VIP joins to misses rather than crashing the aggregator.
-func startServiceVIPWatch(ctx context.Context, f cliFlags, idx *discovery.ServiceIndex) {
+// startClusterEndpointWatch launches the cluster-wide Service + EndpointSlice
+// watch. It feeds podIndex (every workload's pod IP → its pod identity, for the
+// direct cross-node path) always, and svcIndex (Service ClusterIP → backend,
+// for the VIP path) which the caller exposes to joins only under
+// --resolve-service-vip. Runs until ctx is cancelled; watch errors are retried
+// internally, so a transient RBAC/API hiccup degrades joins to misses rather
+// than crashing the aggregator.
+func startClusterEndpointWatch(ctx context.Context, f cliFlags, svcIdx *discovery.ServiceIndex, podIdx *discovery.PodEndpointIndex) {
 	w := &discovery.ServiceWatcher{
 		APIServer: f.k8sAPIServer,
 		CAFile:    f.k8sCAFile,
 		TokenFile: f.k8sTokenFile,
-		Index:     idx,
+		Index:     svcIdx,
+		PodIndex:  podIdx,
 	}
 	go func() {
 		if err := w.Run(ctx); err != nil && ctx.Err() == nil {
-			log.Printf("service-vip watch: %v", err)
+			log.Printf("cluster endpoint watch: %v", err)
 		}
 	}()
-	fmt.Fprintln(os.Stderr, "kloudlens-aggregator: service-vip resolution watching services + endpointslices cluster-wide")
+	fmt.Fprintln(os.Stderr, "kloudlens-aggregator: cluster endpoint watch (pod-index + service-vip) watching services + endpointslices cluster-wide")
 }
 
 func parseAgents(csv string) []aggregator.AgentEndpoint {
@@ -359,11 +365,16 @@ func serveReExport(addr, aggregatorID string, agg *aggregator.Aggregator) (func(
 // EndpointSliceWatcher and bridges its Endpoint emissions into the
 // aggregator.AgentEndpoint shape the aggregator consumes. Runs until ctx is
 // cancelled; the returned channel closes when the watcher goroutine exits.
-func startK8sDiscovery(ctx context.Context, f cliFlags, podIndex *discovery.PodEndpointIndex) (<-chan []aggregator.AgentEndpoint, error) {
+func startK8sDiscovery(ctx context.Context, f cliFlags) (<-chan []aggregator.AgentEndpoint, error) {
 	ns, svc, ok := strings.Cut(f.k8sService, "/")
 	if !ok || ns == "" || svc == "" {
 		return nil, fmt.Errorf("--k8s-service must be namespace/name, got %q", f.k8sService)
 	}
+	// This watch is scoped to the agent Service (namespace + service-name
+	// selector) and is used only to discover agent pods to subscribe to. It
+	// deliberately does NOT feed the pod-index: that index needs every
+	// workload's pod IP cluster-wide, which the cluster-wide Service +
+	// EndpointSlice watch (startClusterEndpointWatch) supplies instead.
 	w := &discovery.EndpointSliceWatcher{
 		APIServer:   f.k8sAPIServer,
 		CAFile:      f.k8sCAFile,
@@ -371,7 +382,6 @@ func startK8sDiscovery(ctx context.Context, f cliFlags, podIndex *discovery.PodE
 		Namespace:   ns,
 		ServiceName: svc,
 		TargetPort:  int32(f.agentPort), // #nosec G115 -- CLI flag (int) narrowing to int32 port
-		PodIndex:    podIndex,
 	}
 	src, err := w.Run(ctx)
 	if err != nil {

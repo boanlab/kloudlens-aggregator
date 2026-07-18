@@ -150,33 +150,3 @@ func contains(s []string, v string) bool {
 	return false
 }
 
-// entriesFromState flattens watcher state into PodEndpointEntry values, keeping
-// only ready endpoints. Shared by the watcher's index-fold path.
-func entriesFromState(state map[string]sliceObject) []PodEndpointEntry {
-	var out []PodEndpointEntry
-	for _, slice := range state {
-		var ports []int32
-		for _, p := range slice.Ports {
-			if p.Port != 0 {
-				ports = append(ports, p.Port)
-			}
-		}
-		if len(ports) == 0 {
-			continue
-		}
-		for _, ep := range slice.Endpoints {
-			if !endpointReady(ep) {
-				continue
-			}
-			for _, addr := range ep.Addresses {
-				out = append(out, PodEndpointEntry{
-					IP:        addr,
-					Ports:     ports,
-					Namespace: ep.TargetRef.Namespace,
-					Pod:       ep.TargetRef.Name,
-				})
-			}
-		}
-	}
-	return out
-}
