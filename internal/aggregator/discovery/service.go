@@ -106,7 +106,11 @@ func (idx *ServiceIndex) ResolveVIP(addr string) (backends []string, namespace, 
 	}
 	portName, found := "", false
 	for _, p := range svc.ports {
-		if p.port == int32(port) {
+		// Widen the int32 Service port to int for the compare rather than
+		// narrowing the parsed connect port to int32: a port outside the int32
+		// range (an out-of-spec addr) then simply fails to match instead of
+		// wrapping into a spurious hit.
+		if int(p.port) == port {
 			portName, found = p.name, true
 			break
 		}

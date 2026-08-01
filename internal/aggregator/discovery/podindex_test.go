@@ -102,4 +102,3 @@ func TestPodIndexReplaceDropsStale(t *testing.T) {
 		t.Errorf("Len=%d, want 1", idx.Len())
 	}
 }
-

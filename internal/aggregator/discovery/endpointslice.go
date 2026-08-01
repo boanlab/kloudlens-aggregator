@@ -120,7 +120,7 @@ func (w *EndpointSliceWatcher) authHeader() (string, error) {
 // bearerAuth reads a ServiceAccount token file and returns the Authorization
 // header value. Shared by the EndpointSlice and Service watchers.
 func bearerAuth(tokenFile string) (string, error) {
-	token, err := os.ReadFile(tokenFile)
+	token, err := os.ReadFile(tokenFile) // #nosec G304 -- tokenFile is the in-cluster ServiceAccount token path (defaultTokenFile or operator-set), not user input
 	if err != nil {
 		return "", fmt.Errorf("discovery: read token %s: %w", tokenFile, err)
 	}
