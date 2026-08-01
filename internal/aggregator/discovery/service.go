@@ -106,7 +106,11 @@ func (idx *ServiceIndex) ResolveVIP(addr string) (backends []string, namespace, 
 	}
 	portName, found := "", false
 	for _, p := range svc.ports {
-		if p.port == int32(port) {
+		// Widen the int32 Service port to int for the compare rather than
+		// narrowing the parsed connect port to int32: a port outside the int32
+		// range (an out-of-spec addr) then simply fails to match instead of
+		// wrapping into a spurious hit.
+		if int(p.port) == port {
 			portName, found = p.name, true
 			break
 		}
@@ -152,6 +156,12 @@ type ServiceWatcher struct {
 	TokenFile string
 	// Index is refreshed on every Service/EndpointSlice change. Required.
 	Index *ServiceIndex
+	// PodIndex, when non-nil, is refreshed from the same cluster-wide
+	// EndpointSlice watch so a connect to a concrete pod IP resolves to its
+	// backing pod. Optional: nil leaves pod-IP resolution to whatever else
+	// feeds the index. This is what makes the direct (pod-IP) cross-node path
+	// work — the agent-discovery watch only sees the agent Service's endpoints.
+	PodIndex *PodEndpointIndex
 	// HTTPClient overrides the default client (used by tests). nil in production.
 	HTTPClient *http.Client
 	// ReconnectBackoff is the delay between watch reconnects. 0 → 2s.
@@ -353,6 +363,8 @@ func (w *ServiceWatcher) applySlices(state map[string]json.RawMessage) {
 		ips   map[string]struct{}
 	}
 	groups := make(map[string]*acc)
+	// Collected across all namespaces for the pod-index (only when wired).
+	var podEntries []PodEndpointEntry
 	for _, raw := range state {
 		var so svcSliceObject
 		if err := json.Unmarshal(raw, &so); err != nil {
@@ -380,6 +392,24 @@ func (w *ServiceWatcher) applySlices(state map[string]json.RawMessage) {
 			for _, ip := range ep.Addresses {
 				g.ips[ip] = struct{}{}
 			}
+			// Fold ready endpoints into the pod-index (all namespaces): the
+			// endpoint IP → its backing pod identity + the ports it serves.
+			if w.PodIndex != nil && ep.TargetRef.Name != "" {
+				ports := make([]int32, 0, len(so.Ports))
+				for _, p := range so.Ports {
+					if p.Port != 0 {
+						ports = append(ports, p.Port)
+					}
+				}
+				for _, ip := range ep.Addresses {
+					podEntries = append(podEntries, PodEndpointEntry{
+						IP:        ip,
+						Ports:     ports,
+						Namespace: ep.TargetRef.Namespace,
+						Pod:       ep.TargetRef.Name,
+					})
+				}
+			}
 		}
 	}
 	out := make(map[string]sliceGroup, len(groups))
@@ -392,6 +422,12 @@ func (w *ServiceWatcher) applySlices(state map[string]json.RawMessage) {
 		out[key] = sliceGroup{ports: g.ports, podIPs: ips}
 	}
 	w.Index.SetSlices(out)
+	// Replace is whole-state, so a pod whose EndpointSlice vanished (deleted /
+	// not-ready) drops out of the index — the connect to its now-stale IP then
+	// misses honestly instead of resolving to a same-port survivor.
+	if w.PodIndex != nil {
+		w.PodIndex.Replace(podEntries)
+	}
 }
 
 // clusterIPsOf returns the routable ClusterIP(s) of a Service, skipping the
@@ -485,5 +521,12 @@ type svcSliceObject struct {
 			Ready       *bool `json:"ready"`
 			Terminating *bool `json:"terminating"`
 		} `json:"conditions"`
+		// TargetRef identifies the pod backing this endpoint. Its namespace/name
+		// feed the PodEndpointIndex so a connect to a concrete pod IP can be
+		// attributed to the specific pod even when it bound a wildcard address.
+		TargetRef struct {
+			Namespace string `json:"namespace"`
+			Name      string `json:"name"`
+		} `json:"targetRef"`
 	} `json:"endpoints"`
 }

@@ -12,8 +12,9 @@
 // is the single-aggregator sustained throughput ceiling (Join is mutex-serialized).
 //
 // Run:
-//   go test -run '^$' -bench 'BenchmarkJoin' -benchmem \
-//     ./internal/aggregator/clusterpeers/ | tee registry_scale.txt
+//
+//	go test -run '^$' -bench 'BenchmarkJoin' -benchmem \
+//	  ./internal/aggregator/clusterpeers/ | tee registry_scale.txt
 package clusterpeers
 
 import (
@@ -94,6 +95,34 @@ func (s synthResolver) ResolvePodAddr(addr string) (string, bool) {
 		return s.backing, true
 	}
 	return "", false
+}
+
+// BenchmarkJoinEndpointSlice measures the EndpointSlice-fold path (HowEndpointslice):
+// an exact miss on the connect destination, then an EndpointResolver DNAT to a
+// backing pod addr that hits exactly. Isolates the resolver + second-lookup cost.
+func BenchmarkJoinEndpointSlice(b *testing.B) {
+	for _, n := range registrySizes {
+		backing := "10.244.2.196:6379"
+		r := NewRegistry(time.Hour, synthResolver{backing: backing}, nil)
+		// Fill with n unrelated exact listeners, plus the one real backend.
+		_, keys := buildExactRegistry(n)
+		for _, k := range keys {
+			r.Observe(Listener{Addr: k, Port: "6379", Process: "/x"})
+		}
+		r.Observe(Listener{
+			Addr: backing, Port: "6379", Process: "/usr/local/bin/redis-server",
+			NodeName: "camel", Namespace: "xnode", Pod: "ra",
+		})
+		b.Run(fmt.Sprintf("N=%d", n), func(b *testing.B) {
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if _, how, ok := r.Join("10.99.0.1:80", "boar"); !ok || how != HowEndpointslice {
+					b.Fatalf("expected endpointslice hit at N=%d", n)
+				}
+			}
+		})
+	}
 }
 
 // synthSvc is a synthetic ServiceResolver: it resolves one Service ClusterIP:port

@@ -102,27 +102,3 @@ func TestPodIndexReplaceDropsStale(t *testing.T) {
 		t.Errorf("Len=%d, want 1", idx.Len())
 	}
 }
-
-func TestEntriesFromStateFiltersUnready(t *testing.T) {
-	state := map[string]sliceObject{
-		"s": {
-			Ports: []slicePort{{Port: 8080}},
-			Endpoints: []sliceEndpoint{
-				{Addresses: []string{"10.0.0.1"}, Conditions: struct {
-					Ready       *bool `json:"ready"`
-					Serving     *bool `json:"serving"`
-					Terminating *bool `json:"terminating"`
-				}{Ready: ptrTrue()}},
-				{Addresses: []string{"10.0.0.2"}, Conditions: struct {
-					Ready       *bool `json:"ready"`
-					Serving     *bool `json:"serving"`
-					Terminating *bool `json:"terminating"`
-				}{Ready: ptrFalse()}},
-			},
-		},
-	}
-	got := entriesFromState(state)
-	if len(got) != 1 || got[0].IP != "10.0.0.1" {
-		t.Fatalf("entriesFromState should keep only ready endpoints: %+v", got)
-	}
-}

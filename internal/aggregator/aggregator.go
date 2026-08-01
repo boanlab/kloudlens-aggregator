@@ -407,7 +407,7 @@ func (a *Aggregator) writeLoop() {
 		// inherits the next cluster seq — the edge is contiguous with its
 		// trigger in both the WAL and the re-export stream, and no extra
 		// synchronisation is needed because writeLoop is the sole seq assigner.
-		if a.foldAdvertise(ev.Envelope) {
+		if a.foldAdvertise(ev.Envelope) || a.foldWithdraw(ev.Envelope) {
 			continue
 		}
 		a.emitEnvelope(marshal, ev)
@@ -475,6 +475,21 @@ func (a *Aggregator) foldAdvertise(env *pb.EventEnvelope) bool {
 	}
 	if l, ok := clusterpeers.ListenerFromAdvertise(intent); ok {
 		a.registry.Observe(l)
+	}
+	return true
+}
+
+// foldWithdraw folds a ListenerWithdraw envelope into the cluster registry,
+// retiring the named listener immediately. Like an advertise it is consumed
+// (control-plane chatter), not re-emitted downstream. Returns true when the
+// envelope was a withdraw.
+func (a *Aggregator) foldWithdraw(env *pb.EventEnvelope) bool {
+	intent := env.GetIntent()
+	if intent == nil || intent.GetKind() != clusterpeers.KindListenerWithdraw {
+		return false
+	}
+	if l, ok := clusterpeers.ListenerFromWithdraw(intent); ok {
+		a.registry.Remove(l)
 	}
 	return true
 }

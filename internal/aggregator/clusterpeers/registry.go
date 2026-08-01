@@ -242,6 +242,36 @@ func (r *Registry) Observe(l Listener) {
 	r.exact[l.Addr] = l
 }
 
+// Remove retires a listener the moment its binder exits, the counterpart of
+// Observe. It deletes the exact-addr or per-pod wildcard entry the advertise
+// created, so a withdrawn listener stops resolving connects immediately rather
+// than lingering until its TTL expires. A withdraw that names no live entry
+// (already expired, or never observed) is a no-op.
+func (r *Registry) Remove(l Listener) {
+	if l.Addr == "" {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if l.Wildcard {
+		port := portOf(l.Port, l.Addr)
+		if port == "" {
+			return
+		}
+		key := ":" + port
+		inner := r.wild[key]
+		if inner == nil {
+			return
+		}
+		delete(inner, podIdent(l.Namespace, l.Pod))
+		if len(inner) == 0 {
+			delete(r.wild, key)
+		}
+		return
+	}
+	delete(r.exact, l.Addr)
+}
+
 // Join resolves connectAddr ("ip:port") to a live cluster listener. It returns
 // the matched Listener, the resolution path, and ok=false on a miss. connectorNode
 // is the connecting side's node; callers use it to set the ClusterPeerEdge

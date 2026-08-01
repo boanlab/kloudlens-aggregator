@@ -12,6 +12,7 @@ import (
 // Wire contract constants (LOCKED — see CROSS_NODE_DESIGN.md).
 const (
 	KindListenerAdvertise = "ListenerAdvertise"
+	KindListenerWithdraw  = "ListenerWithdraw"
 	KindNetworkExchange   = "NetworkExchange"
 	KindClusterPeerEdge   = "ClusterPeerEdge"
 
@@ -47,6 +48,29 @@ func ListenerFromAdvertise(ev *pb.IntentEvent) (Listener, bool) {
 		Container:   m.GetContainer(),
 		ContainerID: m.GetContainerId(),
 		Image:       m.GetImage(),
+	}, true
+}
+
+// ListenerFromWithdraw builds the identity of a listener to retire from a
+// ListenerWithdraw IntentEvent. Only the fields Registry.Remove keys on are
+// populated — Addr for an exact entry, and (Port, Namespace, Pod) for a
+// wildcard entry indexed per pod. Returns ok=false for a malformed event.
+func ListenerFromWithdraw(ev *pb.IntentEvent) (Listener, bool) {
+	if ev == nil || ev.GetKind() != KindListenerWithdraw {
+		return Listener{}, false
+	}
+	attrs := ev.GetAttributes()
+	addr := attrs["addr"]
+	if addr == "" {
+		return Listener{}, false
+	}
+	m := ev.GetMeta()
+	return Listener{
+		Addr:      addr,
+		Port:      attrs["port"],
+		Wildcard:  attrs["wildcard"] == "true",
+		Namespace: m.GetNamespace(),
+		Pod:       m.GetPod(),
 	}, true
 }
 
