@@ -16,6 +16,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -186,11 +187,18 @@ func (w *WAL) ReadFrom(fromSeq uint64, cb func(Entry) error) error {
 	if fromSeq > 0 && fromSeq+1 < oldest {
 		return ErrCursorExpired
 	}
+	gap := false
 	for _, s := range views {
 		if s.endSeq <= fromSeq {
 			continue
 		}
 		f, err := os.Open(s.path)
+		if errors.Is(err, fs.ErrNotExist) {
+			// Segment reclaimed mid-replay: skip it and report the shortfall
+			// as ErrCursorExpired rather than failing the whole read.
+			gap = true
+			continue
+		}
 		if err != nil {
 			return err
 		}
@@ -215,6 +223,9 @@ func (w *WAL) ReadFrom(fromSeq uint64, cb func(Entry) error) error {
 			}
 		}
 		_ = f.Close()
+	}
+	if gap {
+		return ErrCursorExpired
 	}
 	return nil
 }

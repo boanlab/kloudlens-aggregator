@@ -98,8 +98,8 @@ func PeerEdge(src *pb.IntentEvent, l Listener, how How, connectorNode string) *p
 	}
 	// Service-VIP resolution carries the backing Service and, when the flow could
 	// have been DNATed to any of several replicas, marks the specific replica
-	// (peer_pod/peer_node) ambiguous. peer_process/peer_image stay correct: the
-	// replicas run one workload, which is exactly what the paper attributes.
+	// (peer_pod/peer_node) ambiguous. peer_process/peer_image stay correct,
+	// since the replicas run one workload.
 	if svc := l.Service.String(); svc != "" {
 		attrs["peer_service"] = svc
 	}

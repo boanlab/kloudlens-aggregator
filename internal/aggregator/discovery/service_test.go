@@ -210,7 +210,7 @@ func TestApplySlicesFeedsPodIndex(t *testing.T) {
 		"labels":{"kubernetes.io/service-name":"redis-single-svc"}},
 		"ports":[{"name":"","port":6379}],
 		"endpoints":[{"addresses":["10.244.2.106"],"conditions":{"ready":true},
-			"targetRef":{"namespace":"xnode","name":"redis-single-abc"}}]}`
+			"targetRef":{"kind":"Pod","namespace":"xnode","name":"redis-single-abc"}}]}`
 
 	podIdx := NewPodEndpointIndex()
 	w := &ServiceWatcher{Index: NewServiceIndex(), PodIndex: podIdx}
@@ -240,9 +240,9 @@ func TestApplySlicesPodIndexDropsDeletedPod(t *testing.T) {
 		"ports":[{"name":"","port":6379}],
 		"endpoints":[
 			{"addresses":["10.244.2.106"],"conditions":{"ready":true},
-			 "targetRef":{"namespace":"xnode","name":"ra"}},
+			 "targetRef":{"kind":"Pod","namespace":"xnode","name":"ra"}},
 			{"addresses":["10.244.2.116"],"conditions":{"ready":true},
-			 "targetRef":{"namespace":"xnode","name":"rb"}}]}`
+			 "targetRef":{"kind":"Pod","namespace":"xnode","name":"rb"}}]}`
 	podIdx := NewPodEndpointIndex()
 	w := &ServiceWatcher{Index: NewServiceIndex(), PodIndex: podIdx}
 	w.applySlices(rawState(t, twoReady))
@@ -257,7 +257,7 @@ func TestApplySlicesPodIndexDropsDeletedPod(t *testing.T) {
 		"ports":[{"name":"","port":6379}],
 		"endpoints":[
 			{"addresses":["10.244.2.106"],"conditions":{"ready":true},
-			 "targetRef":{"namespace":"xnode","name":"ra"}}]}`
+			 "targetRef":{"kind":"Pod","namespace":"xnode","name":"ra"}}]}`
 	w.applySlices(rawState(t, onlyRA))
 
 	if _, _, ok := podIdx.PodForIP("10.244.2.116"); ok {

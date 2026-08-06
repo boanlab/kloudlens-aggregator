@@ -118,8 +118,8 @@ func (p *podLocResolver) PodForIP(ip string) (string, string, bool) {
 	return v[0], v[1], true
 }
 
-// TestJoinWildcardBaseSinglePod is the GATE: the single-live-pod base case that a
-// prior churn fix regressed. One pod binds 0.0.0.0:6379 and is in the pod index;
+// TestJoinWildcardBaseSinglePod is the GATE: the single-live-pod base case.
+// One pod binds 0.0.0.0:6379 and is in the pod index;
 // a connect to that pod's concrete IP:port MUST join and attribute that pod,
 // cross-node, via the wildcard path. If this ever misses, cross-node attribution
 // is blind for the common case, so it is guarded first.
@@ -515,5 +515,30 @@ func TestPeerEdgeAttribution(t *testing.T) {
 	same := PeerEdge(src, lis("10.0.0.5:8080", "node-a"), HowDirect, "node-a")
 	if same.GetAttributes()["attribution"] != "same-node" {
 		t.Errorf("same-node attribution not set: %+v", same.GetAttributes())
+	}
+}
+
+// TestJoinWildcardNeverAnswersForAnotherPod pins the misattribution measured on
+// the live cluster: three pods bound 0.0.0.0:80 across two nodes, and flows to
+// nginx-alpaca resolved to nginx-camel because the port's "sole" live entry was
+// returned when the destination pod's own entry was absent. A located pod whose
+// entry is missing must be an honest miss, never another workload.
+func TestJoinWildcardNeverAnswersForAnotherPod(t *testing.T) {
+	clk := &fakeClock{t: time.Unix(1000, 0)}
+	loc := &podLocResolver{ips: map[string][2]string{
+		"10.244.0.168": {"oracle", "nginx-alpaca"}, // the connect destination
+	}}
+	r := newTestRegistry(t, clk, loc)
+
+	// Only the OTHER node's pod advertised :80.
+	other := lisPod("0.0.0.0:80", "camel", "nginx-camel")
+	other.Namespace = "oracle"
+	other.Wildcard = true
+	r.Observe(other)
+
+	got, how, ok := r.Join("10.244.0.168:80", "boar")
+	if ok {
+		t.Fatalf("resolved a flow to nginx-alpaca as %q/%q (how=%v); want an honest miss",
+			got.Pod, got.NodeName, how)
 	}
 }
