@@ -33,7 +33,11 @@ rolls automatically.
   gRPC surface so downstream subscribers survive aggregator restarts.
 - Cluster-wide peer attribution: joins a connect to the remote process,
   pod, and node across agents, via exact address, EndpointSlice, Service
-  VIP, or wildcard bind.
+  VIP, or wildcard bind. Listeners enter the registry on
+  `ListenerAdvertise` and leave on `ListenerWithdraw` when the binding
+  process exits, so an address reused by a new process is never
+  attributed to its predecessor. A 30s TTL is the backstop for an agent
+  that crashes or partitions before its withdraw arrives.
 - NDJSON sink to stdout / stderr / file.
 - Optional re-export gRPC server for downstream subscribers, honouring the
   subscription's kind, namespace, pod, and minimum-severity filter on both
