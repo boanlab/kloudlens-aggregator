@@ -173,10 +173,10 @@ func TestJoinWildcardIdentityMismatch(t *testing.T) {
 	}
 }
 
-// TestJoinWildcardChurnDistinctPods is the crux: two pods on one node both bind
+// TestJoinWildcardChurnDistinctPods: two pods on one node both bind
 // 0.0.0.0:6379 with different pod IPs. A connect to each pod's IP must resolve
-// to THAT pod, with no collision on the shared wildcard port (the bug was that
-// both collapsed onto one ":6379" key and the last writer won).
+// to that pod; the shared wildcard port must not collapse them onto one
+// ":6379" key where the last writer wins.
 func TestJoinWildcardChurnDistinctPods(t *testing.T) {
 	clk := &fakeClock{t: time.Unix(1000, 0)}
 	loc := &podLocResolver{ips: map[string][2]string{
@@ -518,11 +518,10 @@ func TestPeerEdgeAttribution(t *testing.T) {
 	}
 }
 
-// TestJoinWildcardNeverAnswersForAnotherPod pins the misattribution measured on
-// the live cluster: three pods bound 0.0.0.0:80 across two nodes, and flows to
-// nginx-alpaca resolved to nginx-camel because the port's "sole" live entry was
-// returned when the destination pod's own entry was absent. A located pod whose
-// entry is missing must be an honest miss, never another workload.
+// TestJoinWildcardNeverAnswersForAnotherPod: with several pods bound to
+// 0.0.0.0:80 across nodes, returning a port's "sole" live entry when the
+// destination pod's own entry is absent attributes the flow to the wrong
+// workload. A located pod whose entry is missing must be an honest miss.
 func TestJoinWildcardNeverAnswersForAnotherPod(t *testing.T) {
 	clk := &fakeClock{t: time.Unix(1000, 0)}
 	loc := &podLocResolver{ips: map[string][2]string{
