@@ -81,7 +81,7 @@ func parseFlags() cliFlags {
 		"consumer_id tag sent on every Subscribe; per-agent cursor is keyed on this value")
 	flag.DurationVar(&f.backoff, "backoff", 2*time.Second,
 		"retry delay between Subscribe reconnects on a single agent")
-	flag.IntVar(&f.queueDepth, "queue-depth", 1024,
+	flag.IntVar(&f.queueDepth, "queue-depth", 16384,
 		"internal fan-in channel size; envelopes dropped when full")
 	flag.StringVar(&f.metricsAddr, "metrics-addr", "",
 		"host:port to serve /healthz, /readyz, /metrics, /stats (disabled when empty)")

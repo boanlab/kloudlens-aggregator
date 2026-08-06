@@ -102,7 +102,7 @@ wildcard connect degrades to an unattributed flow.
 | `--cursor-file` | *(empty)* | Per-(agent, stream) cursor JSON. Empty means no persistence, so a restart resumes from the live tail. |
 | `--consumer-id` | `kloudlens-aggregator` | `consumer_id` sent on every Subscribe; the per-agent cursor is keyed on it. |
 | `--aggregator-id` | `kloudlens-aggregator` | `NodeId` stamped on outgoing re-export cursors, so downstream can federate several clusters. |
-| `--queue-depth` | `1024` | Internal fan-in channel size; envelopes are dropped when it is full (see `kloudlens_aggregator_dropped_total`). |
+| `--queue-depth` | `16384` | Internal fan-in channel size; envelopes are dropped when it is full (see `kloudlens_aggregator_dropped_total`). Sized to absorb burstiness, not sustained overload — if drops persist, the sink or WAL is the bottleneck rather than this buffer. |
 | `--backoff` | `2s` | Retry delay between Subscribe reconnects on one agent. |
 | `--wal-dir` | *(empty)* | WAL directory for merged envelopes. Empty means no WAL, and re-export then serves live subscribers only. |
 | `--wal-max-bytes` | `2 GiB` | Soft cap on WAL retention; oldest segments are trimmed past it. |
