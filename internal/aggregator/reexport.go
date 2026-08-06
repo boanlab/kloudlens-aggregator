@@ -5,6 +5,7 @@ package aggregator
 
 import (
 	"errors"
+	"slices"
 
 	"github.com/boanlab/kloudlens-aggregator/internal/aggregator/envwal"
 	pb "github.com/boanlab/kloudlens/protobuf"
@@ -76,14 +77,15 @@ func (r *ReExportServer) Subscribe(req *pb.SubscribeRequest, stream pb.EventServ
 		streamName = req.GetStreams()[0]
 	}
 
-	var fromSeq uint64
-	if c := req.GetCursor(); c != nil {
-		fromSeq = c.GetSeq()
-	}
+	// No cursor means "from now": attach to the live tail without replaying
+	// retained history. A caller wanting a backfill sends an explicit cursor
+	// (seq 0 replays everything the WAL still holds).
+	cur := req.GetCursor()
+	filter := req.GetFilter()
 
 	var lastSentSeq uint64
-	if r.agg.cfg.WAL != nil {
-		if err := r.replayWAL(stream, r.agg.cfg.WAL, fromSeq, streamName, &lastSentSeq); err != nil {
+	if cur != nil && r.agg.cfg.WAL != nil {
+		if err := r.replayWAL(stream, r.agg.cfg.WAL, cur.GetSeq(), streamName, filter, &lastSentSeq); err != nil {
 			return err
 		}
 	}
@@ -103,7 +105,7 @@ func (r *ReExportServer) Subscribe(req *pb.SubscribeRequest, stream pb.EventServ
 			if ev.Seq <= lastSentSeq {
 				continue
 			}
-			if !streamMatches(streamName, ev.Envelope) {
+			if !streamMatches(streamName, ev.Envelope) || !envelopePassesFilter(ev.Envelope, filter) {
 				continue
 			}
 			out := r.stampCursor(ev.Envelope, ev.Seq, streamName)
@@ -115,9 +117,9 @@ func (r *ReExportServer) Subscribe(req *pb.SubscribeRequest, stream pb.EventServ
 	}
 }
 
-func (r *ReExportServer) replayWAL(stream pb.EventService_SubscribeServer, wal *envwal.WAL, fromSeq uint64, streamName string, lastSent *uint64) error {
+func (r *ReExportServer) replayWAL(stream pb.EventService_SubscribeServer, wal *envwal.WAL, fromSeq uint64, streamName string, filter *pb.EventFilter, lastSent *uint64) error {
 	err := wal.ReadFrom(fromSeq, func(e envwal.Entry) error {
-		if !streamMatches(streamName, e.Envelope) {
+		if !streamMatches(streamName, e.Envelope) || !envelopePassesFilter(e.Envelope, filter) {
 			return nil
 		}
 		out := r.stampCursor(e.Envelope, e.Seq, streamName)
@@ -168,6 +170,66 @@ func streamMatches(want string, env *pb.EventEnvelope) bool {
 		return want == "audit"
 	}
 	return false
+}
+
+// envelopePassesFilter applies SubscribeRequest.filter to one envelope, with the
+// same semantics the on-node EventService uses, so a consumer that filters
+// against an agent gets the same selection when it points at the aggregator.
+// Without it the field is accepted and ignored, and every consumer is served the
+// whole cluster's stream: on a three-node testbed that is hundreds of megabytes
+// per minute, and it is the merged fleet stream that grows with the node count.
+func envelopePassesFilter(env *pb.EventEnvelope, f *pb.EventFilter) bool {
+	if f == nil {
+		return true
+	}
+	if iv := env.GetIntent(); iv != nil {
+		if len(f.GetKinds()) > 0 && !slices.Contains(f.GetKinds(), iv.GetKind()) {
+			return false
+		}
+		if m := iv.GetMeta(); m != nil {
+			if len(f.GetNamespaces()) > 0 && !slices.Contains(f.GetNamespaces(), m.GetNamespace()) {
+				return false
+			}
+			if len(f.GetPods()) > 0 && !slices.Contains(f.GetPods(), m.GetPod()) {
+				return false
+			}
+		}
+		return f.GetMinSeverity() == 0 || iv.GetSeverity() >= f.GetMinSeverity()
+	}
+	if dv := env.GetDeviation(); dv != nil {
+		// min_severity has no deviation analogue (a DeviationEvent carries a
+		// score, not a severity), matching the on-node semantics.
+		if len(f.GetKinds()) > 0 && !slices.Contains(f.GetKinds(), dv.GetKind()) {
+			return false
+		}
+		if m := dv.GetMeta(); m != nil {
+			if len(f.GetNamespaces()) > 0 && !slices.Contains(f.GetNamespaces(), m.GetNamespace()) {
+				return false
+			}
+			if len(f.GetPods()) > 0 && !slices.Contains(f.GetPods(), m.GetPod()) {
+				return false
+			}
+		}
+		return true
+	}
+	if rs := env.GetRawSyscall(); rs != nil {
+		// kinds matches either the syscall name or its category: operators
+		// specify one or the other per rule.
+		if kinds := f.GetKinds(); len(kinds) > 0 &&
+			!slices.Contains(kinds, rs.GetSyscallName()) && !slices.Contains(kinds, rs.GetCategory()) {
+			return false
+		}
+		if m := rs.GetMeta(); m != nil {
+			if len(f.GetNamespaces()) > 0 && !slices.Contains(f.GetNamespaces(), m.GetNamespace()) {
+				return false
+			}
+			if len(f.GetPods()) > 0 && !slices.Contains(f.GetPods(), m.GetPod()) {
+				return false
+			}
+		}
+		return f.GetMinSeverity() == 0 || rs.GetSeverity() >= f.GetMinSeverity()
+	}
+	return true
 }
 
 var _ pb.EventServiceServer = (*ReExportServer)(nil)

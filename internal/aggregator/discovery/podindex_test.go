@@ -3,7 +3,10 @@
 
 package discovery
 
-import "testing"
+import (
+	"encoding/json"
+	"testing"
+)
 
 func TestPodIndexIdentityAndPortFixup(t *testing.T) {
 	idx := NewPodEndpointIndex()
@@ -100,5 +103,70 @@ func TestPodIndexReplaceDropsStale(t *testing.T) {
 	}
 	if idx.Len() != 1 {
 		t.Errorf("Len=%d, want 1", idx.Len())
+	}
+}
+
+// A pod with no Service has no EndpointSlice, so slice-derived identity cannot
+// name it. This is the case that produced zero attributed edges in a 600-connect
+// campaign: every destination was a bare pod, so every wildcard bind stayed
+// unattributable. The pod watch has to cover it, without displacing the
+// slice-derived entries that a Service-backed pod still supplies.
+func TestPodForIPResolvesServicelessPods(t *testing.T) {
+	idx := NewPodEndpointIndex()
+
+	idx.Replace([]PodEndpointEntry{
+		{IP: "10.244.1.5", Ports: []int32{6379}, Namespace: "shop", Pod: "redis-svc-backed"},
+	})
+	idx.ReplacePodIdentities([]PodIdentity{
+		{IP: "10.244.2.9", Namespace: "oracle", Pod: "redis-bare"},
+	})
+
+	if _, pod, ok := idx.PodForIP("10.244.2.9"); !ok || pod != "redis-bare" {
+		t.Errorf("Service-less pod: got (%q, %v), want (redis-bare, true)", pod, ok)
+	}
+	if _, pod, ok := idx.PodForIP("10.244.1.5"); !ok || pod != "redis-svc-backed" {
+		t.Errorf("slice-derived entry was displaced: got (%q, %v)", pod, ok)
+	}
+	if _, _, ok := idx.PodForIP("10.244.9.9"); ok {
+		t.Error("unknown IP resolved; an unseen pod must stay an honest miss")
+	}
+
+	// Each source reconciles whole-state independently; neither may clear the
+	// other. Refreshing the slice side must leave the pod-watch side intact.
+	idx.Replace(nil)
+	if _, pod, ok := idx.PodForIP("10.244.2.9"); !ok || pod != "redis-bare" {
+		t.Errorf("slice reconcile wiped pod-watch identity: got (%q, %v)", pod, ok)
+	}
+	idx.ReplacePodIdentities(nil)
+	if _, _, ok := idx.PodForIP("10.244.2.9"); ok {
+		t.Error("pod removed from the cluster still resolves")
+	}
+}
+
+// hostNetwork pods carry the NODE's IP, so indexing them would name every
+// host-network flow on that node after whichever pod was seen last. Pending and
+// terminated pods likewise must not claim an IP that may already be reassigned.
+func TestApplyPodsSkipsHostNetworkAndNonRunning(t *testing.T) {
+	idx := NewPodEndpointIndex()
+	w := &ServiceWatcher{PodIndex: idx}
+	w.applyPods(map[string]json.RawMessage{
+		"a": json.RawMessage(`{"metadata":{"name":"host-agent","namespace":"kube-system"},
+		                       "spec":{"hostNetwork":true},
+		                       "status":{"podIP":"10.20.0.202","phase":"Running"}}`),
+		"b": json.RawMessage(`{"metadata":{"name":"starting","namespace":"shop"},
+		                       "status":{"podIP":"10.244.3.1","phase":"Pending"}}`),
+		"c": json.RawMessage(`{"metadata":{"name":"live","namespace":"shop"},
+		                       "status":{"podIP":"10.244.3.2","phase":"Running",
+		                                 "podIPs":[{"ip":"10.244.3.2"},{"ip":"fd00::2"}]}}`),
+	})
+	for _, ip := range []string{"10.20.0.202", "10.244.3.1"} {
+		if _, _, ok := idx.PodForIP(ip); ok {
+			t.Errorf("%s should not be indexed", ip)
+		}
+	}
+	for _, ip := range []string{"10.244.3.2", "fd00::2"} {
+		if _, pod, ok := idx.PodForIP(ip); !ok || pod != "live" {
+			t.Errorf("%s: got (%q, %v), want (live, true)", ip, pod, ok)
+		}
 	}
 }

@@ -306,3 +306,94 @@ func TestReExportCursorExpired(t *testing.T) {
 		t.Errorf("want FailedPrecondition, got %v", err)
 	}
 }
+
+// TestReExportHonoursKindFilter asserts that SubscribeRequest.filter selects on
+// the aggregator, not just on an agent. The field is part of the protocol, so a
+// server that accepts and ignores it hands every consumer the whole cluster's
+// merged stream while appearing to have subscribed to one kind.
+func TestReExportHonoursKindFilter(t *testing.T) {
+	a1 := newFakeAgent(t, "agent-1")
+	t.Cleanup(a1.stop)
+
+	var buf safeBuf
+	agg, err := New(Config{
+		Agents: []AgentEndpoint{{
+			Name: "agent-1", Addr: "passthrough:bufconn",
+			DialOpts: []grpc.DialOption{
+				grpc.WithContextDialer(a1.dialer),
+				grpc.WithTransportCredentials(insecure.NewCredentials()),
+			},
+		}},
+		Out:     &buf,
+		Streams: []string{"intent"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	aggCtx, aggCancel := context.WithCancel(context.Background())
+	aggDone := make(chan struct{})
+	go func() { _ = agg.Run(aggCtx); close(aggDone) }()
+	t.Cleanup(func() { aggCancel(); <-aggDone })
+
+	reDialer, reStop := startReExportGRPC(t, agg)
+	t.Cleanup(reStop)
+
+	cc, err := grpc.NewClient("passthrough:bufconn",
+		grpc.WithContextDialer(reDialer),
+		grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cc.Close()
+	subCtx, subCancel := context.WithCancel(context.Background())
+	defer subCancel()
+	stream, err := pb.NewEventServiceClient(cc).Subscribe(subCtx, &pb.SubscribeRequest{
+		ConsumerId: "downstream-filtered",
+		Streams:    []string{"intent"},
+		Filter:     &pb.EventFilter{Kinds: []string{"ClusterPeerEdge"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(200 * time.Millisecond)
+
+	a1.pushIntent("noise-1", "FileRead")
+	a1.pushIntent("wanted-1", "ClusterPeerEdge")
+	a1.pushIntent("noise-2", "FileWrite")
+	a1.pushIntent("wanted-2", "ClusterPeerEdge")
+
+	recv := make(chan *pb.EventEnvelope, 8)
+	go func() {
+		for {
+			env, err := stream.Recv()
+			if err != nil {
+				return
+			}
+			recv <- env
+		}
+	}()
+
+	var got []*pb.EventEnvelope
+	deadline := time.After(3 * time.Second)
+	for len(got) < 2 {
+		select {
+		case env := <-recv:
+			got = append(got, env)
+		case <-deadline:
+			t.Fatalf("timed out; got %d envelopes, want 2", len(got))
+		}
+	}
+	for _, env := range got {
+		if k := env.GetIntent().GetKind(); k != "ClusterPeerEdge" {
+			t.Errorf("filter leaked kind %q", k)
+		}
+	}
+	// Anything further would be a leak: only two matching intents were pushed.
+	select {
+	case env := <-recv:
+		t.Errorf("filter leaked an extra envelope: kind=%q id=%q",
+			env.GetIntent().GetKind(), env.GetIntent().GetIntentId())
+	case <-time.After(300 * time.Millisecond):
+	}
+}

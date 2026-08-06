@@ -33,7 +33,16 @@ type PodEndpointIndex struct {
 	// a concrete pod IP can be attributed to the SPECIFIC advertising pod even
 	// when that pod bound a wildcard (0.0.0.0) address. Only pods this index
 	// actually sees are resolvable; an unknown IP is an honest miss.
-	byIP map[string]podRef
+	//
+	// Two sources feed pod identity, kept in separate maps because each is
+	// refreshed by its own whole-state reconcile; sharing one map would let
+	// either source wipe the other's entries on its next Replace.
+	byIP map[string]podRef // from EndpointSlice targetRefs
+	// podIP holds pods reported directly by the API server. EndpointSlices
+	// exist only for Service-backed pods, so a slice-only index cannot name a
+	// StatefulSet member addressed by pod IP, a bare Job pod, or an operator's
+	// workload; flows to those degrade to unattributable wildcard binds.
+	podIP map[string]podRef
 }
 
 // podRef is the identity of the pod backing an endpoint IP (from targetRef).
@@ -48,7 +57,31 @@ func NewPodEndpointIndex() *PodEndpointIndex {
 		addrs: make(map[string]struct{}),
 		ports: make(map[string][]string),
 		byIP:  make(map[string]podRef),
+		podIP: make(map[string]podRef),
 	}
+}
+
+// PodIdentity is one pod's IP and identity, as reported by the API server.
+type PodIdentity struct {
+	IP        string
+	Namespace string
+	Pod       string
+}
+
+// ReplacePodIdentities atomically swaps the directly-watched pod identities.
+// Whole-state, so departed pods stop resolving. Touches only the pod-watch
+// map: port folding is a property of the Service, not the pod.
+func (idx *PodEndpointIndex) ReplacePodIdentities(pods []PodIdentity) {
+	m := make(map[string]podRef, len(pods))
+	for _, p := range pods {
+		if p.IP == "" || p.Pod == "" {
+			continue
+		}
+		m[p.IP] = podRef{namespace: p.Namespace, pod: p.Pod}
+	}
+	idx.mu.Lock()
+	idx.podIP = m
+	idx.mu.Unlock()
 }
 
 // Replace atomically swaps the index contents for the endpoints in slices. It is
@@ -123,10 +156,16 @@ func (idx *PodEndpointIndex) ResolvePodAddr(connectAddr string) (string, bool) {
 // wildcard (0.0.0.0) address that would otherwise collide with every other pod
 // on the same port. An IP this index has not seen (or a slice with no pod
 // targetRef) returns ok=false: an honest miss, never a guessed pod.
+// EndpointSlice targetRef is consulted first as the narrower statement (a live
+// Service endpoint), the pod watch as the fallback. Order matters only during
+// reconcile skew, since both name the same pod.
 func (idx *PodEndpointIndex) PodForIP(ip string) (namespace, pod string, ok bool) {
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
 	r, found := idx.byIP[ip]
+	if !found {
+		r, found = idx.podIP[ip]
+	}
 	if !found {
 		return "", "", false
 	}

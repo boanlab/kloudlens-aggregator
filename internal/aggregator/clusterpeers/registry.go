@@ -15,6 +15,7 @@
 package clusterpeers
 
 import (
+	"context"
 	"net"
 	"sync"
 	"time"
@@ -162,12 +163,10 @@ type ServiceResolver interface {
 // concurrent use. Populate it with Observe (from ListenerAdvertise) and query
 // it with Join (from NetworkExchange).
 type Registry struct {
-	mu    sync.Mutex
+	mu    sync.RWMutex
 	exact map[string]Listener // key: "ip:port"
-	// wild indexes 0.0.0.0/:: binds. It is a two-level map, keyed first by
-	// ":port" and then by the advertising pod's "namespace/pod", so pods that
-	// all bind the same wildcard port each keep a DISTINCT entry instead of
-	// colliding on one shared key (the correctness bug this structure fixes).
+	// wild indexes 0.0.0.0/:: binds, keyed by ":port" then by the advertising
+	// pod's "namespace/pod" so same-port pods keep distinct entries.
 	wild map[string]map[string]Listener
 	ttl  time.Duration
 
@@ -275,21 +274,21 @@ func (r *Registry) Remove(l Listener) {
 // Join resolves connectAddr ("ip:port") to a live cluster listener. It returns
 // the matched Listener, the resolution path, and ok=false on a miss. connectorNode
 // is the connecting side's node; callers use it to set the ClusterPeerEdge
-// attribution ("cross-node" vs "same-node"). Resolution order mirrors the spec:
+// attribution ("cross-node" vs "same-node"). Resolution order:
 //  1. exact "ip:port" registry hit                → HowDirect
 //  2. EndpointSlice fold to pod "ip:port", exact  → HowEndpointslice
 //  3. Service ClusterIP:port → backend listener(s) → HowServiceVIP
 //  4. wildcard bind, resolved per pod (last resort) → HowWildcard
 //
-// Service-VIP resolution runs before the wildcard fallback so a ClusterIP:port
-// is attributed to its real backend workload rather than colliding with an
-// unrelated wildcard bind that happens to share the destination port. The
-// wildcard step itself never collides across pods: it resolves the connect's
-// pod IP to its owning pod (via the PodLocator) and matches that pod's wildcard
-// entry, so two pods that both bind 0.0.0.0:port are told apart by their IPs.
+// VIP resolution precedes the wildcard fallback so a ClusterIP:port reaches its
+// backend rather than an unrelated bind on the same port.
+// Join is READ-ONLY and takes the shared lock, so joins from every agent stream
+// proceed concurrently; only Observe and Sweep take the exclusive lock. An
+// expired entry is therefore a miss, never a delete: reclamation belongs to
+// Sweep, since deleting here would serialize every join behind the write lock.
 func (r *Registry) Join(connectAddr, _ string) (Listener, How, bool) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	now := r.now()
 
 	// 1. Exact hit.
@@ -372,47 +371,61 @@ func (r *Registry) resolveVIP(backends []string, svc ServiceRef, now time.Time) 
 	return rep, true
 }
 
-// liveExact returns the exact-addr entry if present and unexpired, deleting it
-// (and any wildcard mirror) on expiry. Caller holds r.mu.
+// liveExact returns the exact-addr entry if present, unexpired, and still owned
+// by the pod that advertised it. An expired entry is a miss left for Sweep to
+// reclaim, so this stays read-only. Caller holds r.mu.
 func (r *Registry) liveExact(addr string, now time.Time) (Listener, bool) {
 	l, ok := r.exact[addr]
 	if !ok {
 		return Listener{}, false
 	}
 	if !l.expires.After(now) {
-		delete(r.exact, addr)
+		return Listener{}, false
+	}
+	if !r.stillOwns(l, addr) {
 		return Listener{}, false
 	}
 	return l, true
 }
 
-// liveWild resolves addr against the wildcard index WITHOUT colliding across
-// pods that all bound the same wildcard port.
+// stillOwns reports whether the cluster still places addr's IP on the pod that
+// advertised l. A cluster recycles pod IPs continuously, so an advertise can
+// outlive its pod: the entry sits within its TTL while the IP already belongs to
+// a successor, and returning it would name a departed process as the peer.
 //
-// When a PodLocator is wired, resolution is pod-scoped: the connect's IP is
-// mapped to its owning pod and matched against that pod's wildcard entry. Two
-// pods that both bind 0.0.0.0:port are told apart by their IPs.
+// The test is one-sided. Only a POSITIVE disagreement rejects, when the pod index
+// places the IP on some other pod. An IP the index has never seen is not evidence
+// against l, since a listener pod behind no Service appears in no EndpointSlice
+// at all. Caller holds r.mu.
+func (r *Registry) stillOwns(l Listener, addr string) bool {
+	if r.podLoc == nil || l.Pod == "" {
+		return true
+	}
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return true
+	}
+	ns, pod, ok := r.podLoc.PodForIP(host)
+	if !ok {
+		return true
+	}
+	return ns == l.Namespace && pod == l.Pod
+}
+
+// liveWild resolves addr against the wildcard index without colliding across
+// pods sharing a wildcard port. With a PodLocator wired, the connect IP is
+// mapped to its owning pod and matched against that pod's entry, so two pods
+// on 0.0.0.0:port are told apart by IP. Outcomes:
 //
-// The locator's answer is the honesty pivot:
-//   - The IP maps to a live pod that filed a wildcard entry under that identity →
-//     resolve to it (the collision-free churn path).
-//   - The IP maps to a CONFIRMED-LIVE pod but no entry sits under that exact
-//     identity → fall back to the port's SOLE unambiguous live wildcard listener.
-//     This restores the base cross-node join when the advertising agent's pod
-//     identity and the EndpointSlice targetRef disagree on the namespace/pod
-//     strings for the same physical pod (two independent data sources). It is
-//     safe: the IP is a confirmed-live pod (not a stale/deleted one), and a
-//     single live listener on the port is unambiguous. With two or more live
-//     listeners the port is genuinely ambiguous, so we miss rather than guess.
-//   - The IP cannot be placed at all (unknown, or a since-deleted pod the
-//     EndpointSlice has dropped) → MISS. It must never fall through to a same-port
-//     pod, which would attribute the connect to a possibly stale listener. This is
-//     what makes eviction honest: a deleted pod disappears from the locator
-//     immediately, before its advertise TTL, so its IP no longer resolves.
+//   - live pod with its own entry -> resolve to it;
+//   - live pod, no entry under that identity -> the port's sole live listener
+//     if it names the same pod, covering an advertise/EndpointSlice namespace
+//     disagreement; two or more live listeners are ambiguous, so a miss;
+//   - unplaceable IP (unknown or since-deleted) -> miss, never a same-port
+//     fall-through, which is what keeps eviction honest.
 //
-// Only when NO PodLocator is wired at all (a degraded mode without a pod index)
-// does it skip placement and honour the port's sole live wildcard listener
-// directly. Expired entries are swept as seen. Caller holds r.mu.
+// Without a PodLocator, placement is skipped and the port's sole live listener
+// answers directly. Expired entries are swept as seen. Caller holds r.mu.
 func (r *Registry) liveWild(addr string, now time.Time) (Listener, bool) {
 	host, port, err := net.SplitHostPort(addr)
 	if err != nil || port == "" {
@@ -426,18 +439,16 @@ func (r *Registry) liveWild(addr string, now time.Time) (Listener, bool) {
 	if r.podLoc != nil {
 		ns, pod, ok := r.podLoc.PodForIP(host)
 		if !ok {
-			// The connect IP cannot be placed to any pod (unknown or since-deleted):
-			// an honest miss, never a fall-through to a same-port pod.
-			r.sweepWild(key, now)
+			// Unplaceable IP: a miss, never a same-port fall-through.
 			return Listener{}, false
 		}
-		// The IP is a confirmed-live pod. Prefer its own wildcard entry (this is
-		// what distinguishes two pods sharing the port); otherwise fall back to the
-		// port's sole live listener to survive an advertise/index identity mismatch.
 		if l, ok := r.liveWildPod(key, podIdent(ns, pod), now); ok {
 			return l, true
 		}
-		return r.soleLiveWild(key, now)
+		// Same-pod fallback only, tolerating an advertise/index namespace
+		// disagreement. Any-sole-entry would answer with an unrelated workload,
+		// since every wildcard bind on a port shares one key.
+		return r.soleLiveWildForPod(key, pod, now)
 	}
 
 	// Degraded mode (no pod index): honour the port's wildcard only when a
@@ -446,23 +457,18 @@ func (r *Registry) liveWild(addr string, now time.Time) (Listener, bool) {
 }
 
 // soleLiveWild returns the single live wildcard listener under portKey when
-// EXACTLY ONE remains, sweeping expired entries (and the empty bucket) as it
-// goes. Two or more live listeners are ambiguous (miss); zero is a miss. Caller
-// holds r.mu.
+// EXACTLY ONE remains. Two or more live listeners are ambiguous (miss); zero is
+// a miss. Expired entries are skipped, not deleted, so this stays read-only.
+// Caller holds r.mu.
 func (r *Registry) soleLiveWild(portKey string, now time.Time) (Listener, bool) {
-	inner := r.wild[portKey]
 	var found Listener
 	live := 0
-	for k, l := range inner {
+	for _, l := range r.wild[portKey] {
 		if !l.expires.After(now) {
-			delete(inner, k)
 			continue
 		}
 		found = l
 		live++
-	}
-	if len(inner) == 0 {
-		delete(r.wild, portKey)
 	}
 	if live == 1 {
 		return found, true
@@ -470,35 +476,23 @@ func (r *Registry) soleLiveWild(portKey string, now time.Time) (Listener, bool) 
 	return Listener{}, false
 }
 
-// sweepWild drops expired entries under portKey (and the empty port bucket).
-// Caller holds r.mu.
-func (r *Registry) sweepWild(portKey string, now time.Time) {
-	inner := r.wild[portKey]
-	for k, l := range inner {
-		if !l.expires.After(now) {
-			delete(inner, k)
-		}
-	}
-	if len(inner) == 0 {
-		delete(r.wild, portKey)
-	}
-}
-
-// liveWildPod returns the wildcard entry a specific pod advertised under portKey,
-// deleting it on expiry. A pod that advertised no wildcard on this port is a
-// miss (the caller must not attribute the connect to any other pod). Caller
-// holds r.mu.
-func (r *Registry) liveWildPod(portKey, pod string, now time.Time) (Listener, bool) {
-	inner := r.wild[portKey]
-	l, ok := inner[pod]
-	if !ok {
+// soleLiveWildForPod: the sole live wildcard listener under portKey when it
+// names pod. Pod-name match tolerates a namespace disagreement without
+// answering for another workload. Caller holds r.mu.
+func (r *Registry) soleLiveWildForPod(portKey, pod string, now time.Time) (Listener, bool) {
+	l, ok := r.soleLiveWild(portKey, now)
+	if !ok || l.Pod != pod {
 		return Listener{}, false
 	}
-	if !l.expires.After(now) {
-		delete(inner, pod)
-		if len(inner) == 0 {
-			delete(r.wild, portKey)
-		}
+	return l, true
+}
+
+// liveWildPod returns the wildcard entry a specific pod advertised under portKey.
+// A pod that advertised no wildcard on this port is a miss: the caller must not
+// attribute the connect to any other pod. Read-only. Caller holds r.mu.
+func (r *Registry) liveWildPod(portKey, pod string, now time.Time) (Listener, bool) {
+	l, ok := r.wild[portKey][pod]
+	if !ok || !l.expires.After(now) {
 		return Listener{}, false
 	}
 	return l, true
@@ -507,6 +501,29 @@ func (r *Registry) liveWildPod(portKey, pod string, now time.Time) (Listener, bo
 // podIdent is the wildcard index's inner key: the advertising pod's identity.
 func podIdent(namespace, pod string) string {
 	return namespace + "/" + pod
+}
+
+// Sweep reclaims expired entries. Reclamation is this path's job, not the read
+// path's, which is what lets Join run under the shared lock.
+func (r *Registry) Sweep() { _, _ = r.Stats() }
+
+// SweepEvery reclaims expired entries every interval until ctx is done. A zero
+// or negative interval falls back to the entry TTL, bounding the residency of an
+// expired entry to about one TTL beyond its expiry.
+func (r *Registry) SweepEvery(ctx context.Context, interval time.Duration) {
+	if interval <= 0 {
+		interval = r.ttl
+	}
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			r.Sweep()
+		}
+	}
 }
 
 // Stats reports the number of live (unexpired) exact and wildcard entries,

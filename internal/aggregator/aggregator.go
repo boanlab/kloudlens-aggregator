@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -275,6 +276,13 @@ func (a *Aggregator) Run(ctx context.Context) error {
 		defer writerWg.Done()
 		a.writeLoop()
 	}()
+
+	// The registry's join path is read-only so joins from every agent stream run
+	// concurrently, which leaves reclaiming expired advertises to this sweeper
+	// rather than to the join itself.
+	if a.registry != nil {
+		go a.registry.SweepEvery(ctx, 0)
+	}
 
 	// Seed with the static Agents list (discovery adds to it; if there's no
 	// discovery, this is the whole fleet).
@@ -582,10 +590,22 @@ func (a *Aggregator) subscribeOnce(ctx context.Context, ep AgentEndpoint, stream
 	}
 	defer cc.Close()
 	cl := pb.NewEventServiceClient(cc)
+	// First attach and reconnect are different contracts. A persisted cursor
+	// is a position this collector already acknowledged, so replay from it.
+	// A first attach promised nothing, and seq 0 would replay the agent's whole
+	// retained WAL: at 2 GiB / 2 h that is hours of catch-up during which live
+	// intents queue behind the backlog and cross-node joins miss, the listener
+	// advertisements arriving long after the flows they must join. Start at the
+	// live tail and log it.
+	cur := a.cfg.Cursors.Load(ep.Name, streamName)
+	if cur == nil {
+		log.Printf("aggregator: %s/%s first attach, starting at live tail "+
+			"(retained backlog on the agent is not replayed)", ep.Name, streamName)
+	}
 	req := &pb.SubscribeRequest{
 		ConsumerId: a.cfg.ConsumerID,
 		Streams:    []string{streamName},
-		Cursor:     a.cfg.Cursors.Load(ep.Name, streamName),
+		Cursor:     cur,
 	}
 	stream, err := cl.Subscribe(ctx, req)
 	if err != nil {
