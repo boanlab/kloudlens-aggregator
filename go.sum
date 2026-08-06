@@ -1,7 +1,7 @@
 github.com/beorn7/perks v1.0.1 h1:VlbKKnNfV8bJzeqoa4cOKqO6bYr3WgKZxO8Z16+hsOM=
 github.com/beorn7/perks v1.0.1/go.mod h1:G2ZrVWU2WbWT9wwq4/hrbKbnv/1ERSJQ0ibhJ6rlkpw=
-github.com/boanlab/kloudlens v0.1.5 h1:xUTbqgjmbGgl1CHrpt2MGz5fnLKOaH5uA/OsMopPN+s=
-github.com/boanlab/kloudlens v0.1.5/go.mod h1:lSKRlp0RIAqjfilpNoCZp9RQ7hMeeODGTJvssXnwZfo=
+github.com/boanlab/kloudlens v0.1.6 h1:GfKdlV9bAgMCCGNonPI6bK6VeJN3MGkE+4YQmG2WYDo=
+github.com/boanlab/kloudlens v0.1.6/go.mod h1:B879WkeYEF5A14Tht8ljltiQp9EYEA3PWshVxki0cwM=
 github.com/cespare/xxhash/v2 v2.3.0 h1:UL815xU9SqsFlibzuggzjXhog7bL6oX9BbNZnL2UFvs=
 github.com/cespare/xxhash/v2 v2.3.0/go.mod h1:VGX0DQ3Q6kWi7AoAeZDth3/j3BFtOZR5XLFGgcrjCOs=
 github.com/go-logr/logr v1.4.3 h1:CjnDlHq8ikf6E492q6eKboGOC0T8CDaOvkHCIg8idEI=
