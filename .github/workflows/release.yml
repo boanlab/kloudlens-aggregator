@@ -61,7 +61,4 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
       - name: Push kloudlens-aggregator image
-        run: |
-          make TAG=${{ github.ref_name }} push-image
-          docker tag boanlab/kloudlens-aggregator:${{ github.ref_name }} boanlab/kloudlens-aggregator:latest
-          docker push boanlab/kloudlens-aggregator:latest
+        run: make TAG=${{ github.ref_name }} push-image

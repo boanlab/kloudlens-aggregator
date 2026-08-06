@@ -12,8 +12,8 @@
 #   cross         — build for a specific GOOS/GOARCH into OUT
 #   install       — install bin/kloudlens-aggregator into $(GOBIN)
 #                   (or $HOME/go/bin)
-#   build-image   — docker build boanlab/kloudlens-aggregator:$(TAG)
-#   push-image    — docker push boanlab/kloudlens-aggregator:$(TAG)
+#   build-image   — docker build boanlab/kloudlens-aggregator:$(TAG) + :latest
+#   push-image    — docker push boanlab/kloudlens-aggregator:$(TAG) + :latest
 #   gofmt         — gofmt -s -w ./...
 #   vet           — go vet ./...
 #   golangci-lint — golangci-lint run ./...
@@ -101,7 +101,10 @@ clean:
 	rm -rf bin
 
 build-image:
-	docker build --build-arg VERSION=$(TAG) -f Dockerfile -t $(IMAGE_NAME):$(TAG) .
+	docker build --build-arg VERSION=$(TAG) -f Dockerfile -t $(IMAGE_NAME):$(TAG) -t $(IMAGE_NAME):latest .
 
 push-image: build-image
 	docker push $(IMAGE_NAME):$(TAG)
+ifneq ($(TAG),latest)
+	docker push $(IMAGE_NAME):latest
+endif
